@@ -1,0 +1,22 @@
+seed: 42
+device: cuda
+image_size: 256
+batch_size: 4
+num_workers: 4
+epochs: 50
+lr: 0.0002
+betas: [0.5, 0.999]
+save_every: 1
+sample_every: 200
+style_weight: 0.8
+cycle_weight: 10.0
+identity_weight: 5.0
+content_weight: 1.0
+tv_weight: 0.0001
+paths:
+  photo_train: data/landscape/train
+  ink_train: data/ink/train
+  photo_val: data/landscape/val
+  ink_val: data/ink/val
+  checkpoints: outputs/cyclegan/checkpoints
+  samples: outputs/cyclegan/samples

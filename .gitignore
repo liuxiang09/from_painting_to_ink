@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+
+flickr8k/
+ink_src/
+
+.claude/
+.vscode/
+
