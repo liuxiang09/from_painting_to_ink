@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from src.data.dataset import UnpairedDataset
 from src.models.cyclegan.cycle_gan_model import CycleGANModel
-from src.train.monitor import mean_metric_dict, plot_metric_groups, save_history_csv
+from src.train.monitor import mean_metric_dict, save_history_csv
 
 PROGRESS_NCOLS = 100
 
@@ -147,6 +147,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, cfg["epochs"] + 1):
         metric_sums = init_metric_sums()
+        epoch_sample_batch_idx = (epoch - 1) % len(train_dl)
         progress = tqdm(
             train_dl,
             desc=f"CycleGAN Epoch {epoch}/{cfg['epochs']}",
@@ -155,7 +156,7 @@ def main() -> None:
             leave=True,
         )
 
-        for batch in progress:
+        for batch_idx, batch in enumerate(progress):
             model.set_input(batch)
             model.optimize_parameters()
             metrics = model.get_current_losses()
@@ -171,8 +172,8 @@ def main() -> None:
             )
 
             global_step += 1
-            if global_step % cfg["sample_every"] == 0:
-                save_sample(global_step, model.real_A, model.fake_B, sample_dir)
+            if batch_idx == epoch_sample_batch_idx:
+                save_sample(epoch, model.real_A, model.fake_B, sample_dir)
 
         train_metrics = mean_metric_dict(metric_sums, len(train_dl))
 
@@ -195,14 +196,6 @@ def main() -> None:
         )
 
         save_history_csv(history, metrics_file)
-        plot_metric_groups(
-            history,
-            metrics_dir,
-            [
-                ("loss_curves.png", "CycleGAN Training Loss", ["loss_G", "loss_D_A", "loss_D_B"]),
-                ("component_curves.png", "CycleGAN Training Components", ["cycle_A", "cycle_B", "identity_A", "identity_B", "content", "style", "tv"]),
-            ],
-        )
 
         if epoch % cfg["save_every"] == 0:
             model.save_networks(

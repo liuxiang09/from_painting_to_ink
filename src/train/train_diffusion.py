@@ -52,6 +52,17 @@ def init_metric_sums() -> dict[str, float]:
     }
 
 
+def module_param_stats(module: torch.nn.Module) -> tuple[int, int]:
+    total = 0
+    trainable = 0
+    for param in module.parameters():
+        count = param.numel()
+        total += count
+        if param.requires_grad:
+            trainable += count
+    return total, trainable
+
+
 def accumulate_metrics(metric_sums: dict[str, float], batch_metrics: dict[str, float]) -> None:
     for key in metric_sums:
         metric_sums[key] += batch_metrics[key]
@@ -107,6 +118,9 @@ def main() -> None:
         train_unet=model_cfg.get("train_unet", True),
         train_vae=model_cfg.get("train_vae", False),
         tokens_per_image=model_cfg.get("tokens_per_image", 32),
+        unet_train_mode=model_cfg.get("unet_train_mode", "full"),
+        unet_train_patterns=model_cfg.get("unet_train_patterns"),
+        gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", False)),
         torch_dtype=dtype,
     ).to(device)
     if use_amp:
@@ -118,7 +132,18 @@ def main() -> None:
     trainable_params = [param for param in model.trainable_parameters() if param.requires_grad]
     total_trainable = sum(param.numel() for param in trainable_params)
     unet_trainable = sum(param.numel() for param in model.unet.parameters() if param.requires_grad)
+
+    vae_total, vae_trainable = module_param_stats(model.vae)
+    unet_total, _ = module_param_stats(model.unet)
+    projector_total, projector_trainable = module_param_stats(model.condition_projector)
+
     print(f"diffusion mode={model.unet_mode} trainable_params={total_trainable} unet_trainable={unet_trainable}")
+    print(
+        "module_params "
+        f"vae(total={vae_total},trainable={vae_trainable}) "
+        f"unet(total={unet_total},trainable={unet_trainable}) "
+        f"projector(total={projector_total},trainable={projector_trainable})"
+    )
 
     opt = AdamW(
         trainable_params,
@@ -171,6 +196,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, cfg["epochs"] + 1):
         metric_sums = init_metric_sums()
+        epoch_sample_batch_idx = (epoch - 1) % len(train_dl)
         progress = tqdm(
             train_dl,
             desc=f"Diffusion Epoch {epoch}/{cfg['epochs']}",
@@ -179,7 +205,7 @@ def main() -> None:
             leave=True,
         )
 
-        for batch in progress:
+        for batch_idx, batch in enumerate(progress):
             model.train()
             photo = batch["photo"].to(device)
             ink = batch["ink"].to(device)
@@ -232,8 +258,8 @@ def main() -> None:
             )
 
             global_step += 1
-            if global_step % cfg["sample_every"] == 0:
-                save_sample(global_step, photo, pred_img, sample_dir)
+            if batch_idx == epoch_sample_batch_idx:
+                save_sample(epoch, photo, pred_img, sample_dir)
 
         train_metrics = mean_metric_dict(metric_sums, len(train_dl))
 

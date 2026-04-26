@@ -178,7 +178,6 @@ CycleGAN 输出：
 - `outputs/cyclegan/checkpoints/`
 - `outputs/cyclegan/samples/`
 - `outputs/cyclegan/metrics/history.csv`
-- `outputs/cyclegan/metrics/*.png`（损失曲线）
 
 Diffusion 输出：
 

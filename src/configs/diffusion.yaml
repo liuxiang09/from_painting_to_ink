@@ -1,14 +1,14 @@
 seed: 42
 device: cuda
 image_size: 256
-batch_size: 4
+batch_size: 2
 num_workers: 4
-epochs: 100
+epochs: 40
 lr: 0.00001
 weight_decay: 0.0001
 timesteps: 1000
-timestep_min: 50
-timestep_max: 700
+timestep_min: 100
+timestep_max: 500
 save_every: 10
 sample_every: 200
 style_weight: 8.0
@@ -22,8 +22,18 @@ model:
   pretrained_model: CompVis/stable-diffusion-v1-4
   train_unet: true
   train_vae: false
-  tokens_per_image: 32
+  tokens_per_image: 16
   fp16: true
+  unet_train_mode: partial
+  unet_train_patterns:
+    - mid_block
+    - up_blocks.2
+    - up_blocks.3
+    - to_q
+    - to_k
+    - to_v
+    - to_out
+  gradient_checkpointing: true
 paths:
   photo_train: data/landscape
   ink_train: data/ink/shui_mo

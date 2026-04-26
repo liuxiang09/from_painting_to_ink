@@ -55,6 +55,9 @@ class StableDiffusionStyleTransfer(nn.Module):
         train_unet: bool = True,
         train_vae: bool = False,
         tokens_per_image: int = 32,
+        unet_train_mode: str = "full",
+        unet_train_patterns: list[str] | None = None,
+        gradient_checkpointing: bool = False,
         torch_dtype: torch.dtype | None = None,
     ):
         super().__init__()
@@ -86,8 +89,41 @@ class StableDiffusionStyleTransfer(nn.Module):
         )
 
         self.vae.requires_grad_(train_vae)
-        self.unet.requires_grad_(train_unet)
-        self.unet_mode = "full" if train_unet else "frozen"
+
+        if train_unet:
+            mode = unet_train_mode.strip().lower()
+            if mode == "full":
+                self.unet.requires_grad_(True)
+                self.unet_mode = "full"
+            elif mode == "partial":
+                self.unet.requires_grad_(False)
+                selected_patterns = [p.strip() for p in (unet_train_patterns or []) if p and p.strip()]
+                if not selected_patterns:
+                    selected_patterns = [
+                        "mid_block",
+                        "up_blocks.2",
+                        "up_blocks.3",
+                        "to_q",
+                        "to_k",
+                        "to_v",
+                        "to_out",
+                    ]
+
+                enabled = 0
+                for name, param in self.unet.named_parameters():
+                    if any(pattern in name for pattern in selected_patterns):
+                        param.requires_grad = True
+                        enabled += 1
+                self.unet_mode = f"partial({enabled}_tensors)"
+            else:
+                raise ValueError(f"invalid unet_train_mode: {unet_train_mode}, expected one of ['full', 'partial']")
+        else:
+            self.unet.requires_grad_(False)
+            self.unet_mode = "frozen"
+
+        if gradient_checkpointing and any(param.requires_grad for param in self.unet.parameters()):
+            self.unet.enable_gradient_checkpointing()
+
         if not train_vae:
             self.vae.eval()
 
