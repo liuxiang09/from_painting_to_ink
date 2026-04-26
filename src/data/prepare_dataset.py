@@ -4,36 +4,221 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
+import shutil
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageOps
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable
 
-from case9.data.dataset import ImageRecord, load_image_records, open_record_image
+try:
+    from PIL import Image, ImageDraw, ImageOps
+
+    PIL_AVAILABLE = True
+except ModuleNotFoundError:
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageOps = None  # type: ignore
+    PIL_AVAILABLE = False
+
+VALID_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+INK_CATEGORY_ORDER = ("gong_bi", "shui_mo", "shan_shui", "guo_hua", "yuan_ti", "other")
+PROGRESS_NCOLS = 100
+CLIP_POSITIVE_PROMPTS = [
+    "a landscape photo",
+    "a nature landscape",
+    "a mountain landscape",
+    "a river in nature",
+    "a lake in nature",
+    "a forest landscape",
+    "a scenic outdoor view",
+    "a natural scenery photograph",
+    "a wilderness landscape",
+    "a beach landscape",
+]
+CLIP_NEGATIVE_PROMPTS = [
+    "a portrait photo of a person",
+    "a close-up photo of a person",
+    "a photo of an animal",
+    "a dog or cat photo",
+    "a sports scene",
+    "a street scene with people",
+    "an indoor scene",
+    "a selfie or portrait",
+    "a person standing for the camera",
+    "a photo focused on a human subject",
+]
 
 
-SPLITS = ("train", "val", "test")
+@dataclass
+class ImageRecord:
+    source: str
+    image_path: Path
+    caption: Optional[str] = None
+    category: Optional[str] = None
+    score: float = 0.0
 
 
-def normalize_limit(value: int) -> Optional[int]:
-    return None if value <= 0 else value
+def collect_images(root: Path) -> list[Path]:
+    if not root.exists():
+        raise ValueError(f"Missing directory: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Expected a directory: {root}")
+    return sorted([p for p in root.iterdir() if p.is_file() and p.suffix.lower() in VALID_EXT])
 
 
-def split_counts(total: int, train_ratio: float, val_ratio: float) -> tuple[int, int, int]:
-    train_n = int(total * train_ratio)
-    val_n = int(total * val_ratio)
-    test_n = max(total - train_n - val_n, 0)
-    return train_n, val_n, test_n
+def infer_ink_category(path: Path) -> str:
+    stem = path.stem.lower()
+    if "gong_bi" in stem:
+        return "gong_bi"
+    if "shui_mo" in stem:
+        return "shui_mo"
+    if "shan_shui" in stem:
+        return "shan_shui"
+    if "guo_hua" in stem:
+        return "guo_hua"
+    if "yuan_ti" in stem:
+        return "yuan_ti"
+    return "other"
 
 
-def pick_split(index: int, train_n: int, val_n: int) -> str:
-    if index < train_n:
-        return "train"
-    if index < train_n + val_n:
-        return "val"
-    return "test"
+def load_ink_records(root: Path) -> list[ImageRecord]:
+    records: list[ImageRecord] = []
+    image_paths = collect_images(root)
+    for image_path in tqdm(
+        image_paths,
+        desc="Scan ink_src",
+        ncols=PROGRESS_NCOLS,
+        dynamic_ncols=False,
+        leave=False,
+    ):
+        records.append(
+            ImageRecord(
+                source="ink_src",
+                image_path=image_path,
+                category=infer_ink_category(image_path),
+            )
+        )
+    if not records:
+        raise ValueError(f"No images found under {root}")
+    return records
+
+
+def load_flickr8k_caption_map(root: Path) -> dict[str, list[str]]:
+    caption_path = root / "captions.txt"
+    if not caption_path.exists():
+        raise ValueError(f"Missing Flickr8k caption file: {caption_path}")
+
+    captions_by_image: dict[str, list[str]] = {}
+    with caption_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            image_name = (row.get("image") or "").strip()
+            caption = (row.get("caption") or "").strip()
+            if image_name and caption:
+                captions_by_image.setdefault(image_name, []).append(caption)
+    return captions_by_image
+
+
+def load_flickr8k_image_paths(root: Path) -> list[Path]:
+    image_root = root / "Images"
+    if not image_root.exists():
+        raise ValueError(f"Missing Flickr8k image folder: {image_root}")
+    return collect_images(image_root)
+
+
+def build_clip_ranker(model_name: str):
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "CLIP selection needs 'torch', 'transformers', and 'Pillow'. "
+            "Install them before using CLIP-based dataset filtering."
+        ) from exc
+
+    if not PIL_AVAILABLE:
+        raise ModuleNotFoundError("CLIP selection needs Pillow installed.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    token = os.getenv("HF_TOKEN") or None
+    try:
+        model = CLIPModel.from_pretrained(model_name, use_safetensors=True, token=token)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load CLIP model '{model_name}' with safetensors. "
+            "Please ensure the model provides safetensors weights, and that "
+            "'transformers' plus 'safetensors' are installed."
+        ) from exc
+
+    processor = CLIPProcessor.from_pretrained(model_name, token=token)
+    model.to(device)
+    model.eval()
+    prompts = CLIP_POSITIVE_PROMPTS + CLIP_NEGATIVE_PROMPTS
+    positive_count = len(CLIP_POSITIVE_PROMPTS)
+
+    def score_image(image_path: Path) -> float:
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+        with torch.no_grad():
+            inputs = processor(text=prompts, images=image, return_tensors="pt", padding=True, truncation=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            outputs = model(**inputs)
+            logits = outputs.logits_per_image[0]
+            positive_score = logits[:positive_count].mean().item()
+            negative_score = logits[positive_count:].mean().item()
+            return positive_score - negative_score
+
+    return score_image
+
+
+def load_flickr8k_landscape_records_with_clip(root: Path, target_count: int, clip_model_name: str) -> list[ImageRecord]:
+    captions_by_image = load_flickr8k_caption_map(root)
+    image_paths = load_flickr8k_image_paths(root)
+    score_image = build_clip_ranker(clip_model_name)
+
+    scored_records: list[ImageRecord] = []
+    for image_path in tqdm(
+        image_paths,
+        desc="CLIP score Flickr8k",
+        ncols=PROGRESS_NCOLS,
+        dynamic_ncols=False,
+        leave=True,
+    ):
+        captions = captions_by_image.get(image_path.name, [])
+        score = score_image(image_path)
+        scored_records.append(
+            ImageRecord(
+                source="flickr8k_landscape_clip",
+                image_path=image_path,
+                caption=captions[0] if captions else None,
+                category="landscape",
+                score=score,
+            )
+        )
+
+    scored_records.sort(key=lambda record: (record.score, record.image_path.name), reverse=True)
+    selected = scored_records[:target_count]
+    if len(selected) < target_count:
+        raise ValueError(f"Only found {len(selected)} Flickr8k candidates, fewer than requested {target_count}")
+    return selected
+
+
+def select_ink_category_records(records: list[ImageRecord], category: str, target_count: int, seed: int) -> list[ImageRecord]:
+    category_records = [record for record in records if record.category == category]
+    if len(category_records) < target_count:
+        raise ValueError(f"Only found {len(category_records)} records for ink category '{category}', fewer than requested {target_count}")
+
+    shuffled = list(category_records)
+    random.Random(seed).shuffle(shuffled)
+    return sorted(shuffled[:target_count], key=lambda record: record.image_path.name)
 
 
 def safe_stem(text: str, fallback: str) -> str:
@@ -42,23 +227,27 @@ def safe_stem(text: str, fallback: str) -> str:
     return (cleaned or fallback)[:80]
 
 
-def save_record_image(record: ImageRecord, dst: Path, image_size: int) -> bool:
+def open_record_image(record: ImageRecord) -> Image.Image:
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow is not installed")
+    with Image.open(record.image_path) as img:
+        return img.convert("RGB")
+
+
+def save_record_image(record: ImageRecord, dst: Path, image_size: int) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
     try:
-        image = open_record_image(record)
-        image = ImageOps.fit(image, (image_size, image_size), method=Image.BICUBIC)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        image.save(dst)
-        return True
+        if PIL_AVAILABLE:
+            image = open_record_image(record)
+            image = ImageOps.fit(image, (image_size, image_size), method=Image.BICUBIC)
+            final_dst = dst.with_suffix(".png")
+            image.save(final_dst)
+            return final_dst
+        final_dst = dst.with_suffix(record.image_path.suffix.lower())
+        shutil.copy2(record.image_path, final_dst)
+        return final_dst
     except Exception:
-        return False
-
-
-def source_string(record: ImageRecord) -> str:
-    if record.image_path is not None:
-        return str(record.image_path)
-    if record.url:
-        return record.url
-    return record.source
+        return Path()
 
 
 def export_domain(
@@ -66,31 +255,36 @@ def export_domain(
     out_dir: Path,
     image_size: int,
     seed: int,
-    train_ratio: float,
-    val_ratio: float,
     name_prefix: str,
 ) -> dict:
     shuffled = list(records)
     random.Random(seed).shuffle(shuffled)
 
-    train_n, val_n, _ = split_counts(len(shuffled), train_ratio, val_ratio)
-    counters = {"train": 0, "val": 0, "test": 0, "failed": 0}
+    counters = {"saved": 0, "failed": 0}
     manifest_rows: list[dict[str, str]] = []
+    image_dir = out_dir
 
-    for i, record in enumerate(shuffled):
-        split = pick_split(i, train_n, val_n)
-        stem = record.image_path.stem if record.image_path is not None else f"{name_prefix}_{i:06d}"
-        file_name = f"{safe_stem(stem, name_prefix)}_{i:06d}.png"
-        dst = out_dir / split / file_name
-
-        if save_record_image(record, dst, image_size=image_size):
-            counters[split] += 1
+    for i, record in enumerate(
+        tqdm(
+            shuffled,
+            desc=f"Export {out_dir.name}",
+            ncols=PROGRESS_NCOLS,
+            dynamic_ncols=False,
+            leave=True,
+        )
+    ):
+        file_name = f"{safe_stem(record.image_path.stem, name_prefix)}_{i:06d}"
+        dst = image_dir / file_name
+        saved_path = save_record_image(record, dst, image_size=image_size)
+        if saved_path:
+            counters["saved"] += 1
             manifest_rows.append(
                 {
-                    "split": split,
-                    "file": str(dst),
-                    "source": source_string(record),
+                    "file": str(saved_path),
+                    "source": str(record.image_path),
                     "caption": record.caption or "",
+                    "category": record.category or "",
+                    "score": f"{record.score:.6f}",
                 }
             )
         else:
@@ -98,52 +292,47 @@ def export_domain(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "manifest.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["split", "file", "source", "caption"])
+        writer = csv.DictWriter(f, fieldnames=["file", "source", "caption", "category", "score"])
         writer.writeheader()
         writer.writerows(manifest_rows)
 
     return {
         "total_input": len(shuffled),
-        "train": counters["train"],
-        "val": counters["val"],
-        "test": counters["test"],
+        "saved": counters["saved"],
         "failed": counters["failed"],
         "manifest": str(out_dir / "manifest.csv"),
     }
 
 
 def summarize_records(name: str, records: list[ImageRecord]) -> dict:
-    with_caption = sum(1 for r in records if bool(r.caption and r.caption.strip()))
-    path_count = sum(1 for r in records if r.image_path is not None)
-    bytes_count = sum(1 for r in records if r.image_bytes is not None)
-    url_only = sum(1 for r in records if r.url is not None and r.image_path is None and r.image_bytes is None)
-    local_ready = sum(
-        1
-        for r in records
-        if r.image_bytes is not None or (r.image_path is not None and r.image_path.exists())
-    )
+    with_caption = sum(1 for record in records if bool(record.caption and record.caption.strip()))
+    categories: dict[str, int] = {}
+    for category in INK_CATEGORY_ORDER + ("landscape",):
+        count = sum(1 for record in records if record.category == category)
+        if count > 0:
+            categories[category] = count
     return {
         "dataset": name,
         "records": len(records),
         "with_caption": with_caption,
-        "path_records": path_count,
-        "bytes_records": bytes_count,
-        "url_only_records": url_only,
-        "local_image_ready": local_ready,
+        "categories": categories,
+        "score_min": min((record.score for record in records), default=0.0),
+        "score_max": max((record.score for record in records), default=0.0),
     }
 
 
 def preview_text(record: ImageRecord) -> str:
+    if record.category:
+        return f"{record.category}: {record.image_path.name}"
     if record.caption:
-        return textwrap.shorten(record.caption, width=42, placeholder="…")
-    if record.image_path is not None:
-        return record.image_path.name
-    if record.url:
-        return textwrap.shorten(record.url, width=42, placeholder="…")
-    return record.source
+        return textwrap.shorten(record.caption, width=42, placeholder="...")
+    return record.image_path.name
 
 
 def save_preview_grid(records: list[ImageRecord], out_path: Path, title: str, max_items: int = 12, tile_size: int = 192) -> int:
+    if not PIL_AVAILABLE:
+        return 0
+
     decoded: list[tuple[Image.Image, ImageRecord]] = []
     for record in records:
         try:
@@ -170,120 +359,82 @@ def save_preview_grid(records: list[ImageRecord], out_path: Path, title: str, ma
         y = title_h + (i // cols) * (tile_size + caption_h)
         tile = ImageOps.fit(image, (tile_size, tile_size), method=Image.BICUBIC)
         canvas.paste(tile, (x, y))
-        draw.text((x + 4, y + tile_size + 6), preview_text(record), fill=(20, 20, 20))
+        draw.text((x + 4, y + tile_size + 6), preview_text(record)[:42], fill=(20, 20, 20))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
     return len(decoded)
 
 
-def load_records(dataset_root: Optional[Path], dataset_type: str, limit: Optional[int]) -> list[ImageRecord]:
-    if dataset_root is None:
-        return []
-    if not dataset_root.exists():
-        print(f"[skip] {dataset_type}: missing path {dataset_root}")
-        return []
-    return load_image_records(dataset_root, dataset_type=dataset_type, max_items=limit)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare and preview flickr8k / ink_src / laion-art datasets")
+    parser = argparse.ArgumentParser(description="Prepare a compact CLIP-filtered landscape and ink dataset")
     parser.add_argument("--flickr-root", type=Path, default=Path("flickr8k"))
     parser.add_argument("--ink-root", type=Path, default=Path("ink_src"))
-    parser.add_argument("--laion-root", type=Path, default=Path("laion-art"))
     parser.add_argument("--out-root", type=Path, default=Path("data"))
     parser.add_argument("--preview-root", type=Path, default=Path("outputs/data_preview"))
-    parser.add_argument("--limit-flickr", type=int, default=0, help="0 means all")
-    parser.add_argument("--limit-ink", type=int, default=0, help="0 means all")
-    parser.add_argument("--limit-laion", type=int, default=20000, help="0 means all")
+    parser.add_argument("--photo-count", type=int, default=1000)
+    parser.add_argument("--ink-count", type=int, default=1000)
+    parser.add_argument("--ink-category", type=str, default="shui_mo")
+    parser.add_argument("--clip-model-name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--preview-items", type=int, default=12)
     parser.add_argument("--skip-export", action="store_true")
     args = parser.parse_args()
 
-    flickr_records = load_records(args.flickr_root, "flickr8k", normalize_limit(args.limit_flickr))
-    ink_records = load_records(args.ink_root, "ink_src", normalize_limit(args.limit_ink))
-    laion_records = load_records(args.laion_root, "laion-art", normalize_limit(args.limit_laion))
-
-    photo_records = flickr_records + laion_records
-
-    if not photo_records:
-        raise ValueError("No photo-domain records loaded. Check flickr8k/laion-art paths and parquet dependencies.")
-    if not ink_records:
-        raise ValueError("No ink-domain records loaded. Check ink_src path.")
+    all_ink_records = load_ink_records(args.ink_root)
+    flickr_records = load_flickr8k_landscape_records_with_clip(
+        args.flickr_root,
+        target_count=args.photo_count,
+        clip_model_name=args.clip_model_name,
+    )
+    ink_records = select_ink_category_records(all_ink_records, args.ink_category, args.ink_count, seed=args.seed)
 
     stats = {
-        "flickr8k": summarize_records("flickr8k", flickr_records),
-        "ink_src": summarize_records("ink_src", ink_records),
-        "laion-art": summarize_records("laion-art", laion_records),
-        "photo_domain_total": len(photo_records),
-        "ink_domain_total": len(ink_records),
+        "selected_flickr_landscape": summarize_records("selected_flickr_landscape", flickr_records),
+        "selected_ink": summarize_records(f"selected_ink_{args.ink_category}", ink_records),
+        "selection": {
+            "photo_count": len(flickr_records),
+            "ink_count": len(ink_records),
+            "ink_category": args.ink_category,
+            "photo_selector": "clip",
+            "clip_model_name": args.clip_model_name,
+            "clip_positive_prompts": CLIP_POSITIVE_PROMPTS,
+            "clip_negative_prompts": CLIP_NEGATIVE_PROMPTS,
+        },
     }
 
-    previews = {
-        "flickr8k": save_preview_grid(
+    stats["previews"] = {
+        "flickr_landscape": save_preview_grid(
             flickr_records,
-            args.preview_root / "flickr8k_preview.png",
-            "flickr8k",
-            max_items=args.preview_items,
-        )
-        if flickr_records
-        else 0,
-        "ink_src": save_preview_grid(
-            ink_records,
-            args.preview_root / "ink_src_preview.png",
-            "ink_src",
+            args.preview_root / "flickr_landscape_preview.png",
+            "flickr_landscape",
             max_items=args.preview_items,
         ),
-        "laion-art": save_preview_grid(
-            laion_records,
-            args.preview_root / "laion_art_preview.png",
-            "laion-art",
-            max_items=args.preview_items,
-        )
-        if laion_records
-        else 0,
-        "photo_domain": save_preview_grid(
-            photo_records,
-            args.preview_root / "photo_domain_preview.png",
-            "photo_domain(flickr8k+laion-art)",
-            max_items=args.preview_items,
-        ),
-        "ink_domain": save_preview_grid(
+        f"ink_{args.ink_category}": save_preview_grid(
             ink_records,
-            args.preview_root / "ink_domain_preview.png",
-            "ink_domain",
+            args.preview_root / f"ink_{args.ink_category}_preview.png",
+            f"ink_{args.ink_category}",
             max_items=args.preview_items,
         ),
     }
-
-    stats["previews"] = previews
 
     if not args.skip_export:
-        photo_export = export_domain(
-            photo_records,
-            args.out_root / "landscape",
-            image_size=args.image_size,
-            seed=args.seed,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            name_prefix="photo",
-        )
-        ink_export = export_domain(
-            ink_records,
-            args.out_root / "ink",
-            image_size=args.image_size,
-            seed=args.seed + 1,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            name_prefix="ink",
-        )
         stats["exports"] = {
-            "landscape": photo_export,
-            "ink": ink_export,
+            "landscape": export_domain(
+                flickr_records,
+                args.out_root / "landscape",
+                image_size=args.image_size,
+                seed=args.seed,
+                name_prefix="landscape",
+            ),
+            "ink": export_domain(
+                ink_records,
+                args.out_root / "ink" / args.ink_category,
+                image_size=args.image_size,
+                seed=args.seed + 1,
+                name_prefix=args.ink_category,
+            ),
         }
 
     args.preview_root.mkdir(parents=True, exist_ok=True)

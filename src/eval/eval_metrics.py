@@ -1,9 +1,7 @@
 import argparse
 import csv
-import math
 from pathlib import Path
 
-import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
@@ -18,8 +16,8 @@ def load_images(folder: Path, image_size: int) -> torch.Tensor:
         transforms.ToTensor(),
     ])
     imgs = []
-    for p in sorted(folder.rglob("*")):
-        if p.suffix.lower() in VALID_EXT:
+    for p in sorted(folder.iterdir()):
+        if p.is_file() and p.suffix.lower() in VALID_EXT:
             with Image.open(p) as im:
                 imgs.append(tfm(im.convert("RGB")))
     if not imgs:

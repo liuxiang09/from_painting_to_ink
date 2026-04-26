@@ -1,9 +1,11 @@
 __pycache__/
+outputs/
 *.pyc
 .venv/
 .env
 .DS_Store
 
+data/
 flickr8k/
 ink_src/
 

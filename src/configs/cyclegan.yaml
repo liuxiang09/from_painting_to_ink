@@ -6,17 +6,26 @@ num_workers: 4
 epochs: 50
 lr: 0.0002
 betas: [0.5, 0.999]
-save_every: 1
-sample_every: 200
-style_weight: 0.8
-cycle_weight: 10.0
-identity_weight: 5.0
-content_weight: 1.0
+gan_mode: lsgan
+pool_size: 50
+norm: instance
+init_type: normal
+init_gain: 0.02
+netG: unet_256
+netD: basic
+ngf: 64
+ndf: 64
+n_layers_D: 3
+use_dropout: false
+save_every: 10
+sample_every: 50
+style_weight: 25.0
+cycle_weight: 4.0
+identity_weight: 0.2
+content_weight: 0.3
 tv_weight: 0.0001
 paths:
-  photo_train: data/landscape/train
-  ink_train: data/ink/train
-  photo_val: data/landscape/val
-  ink_val: data/ink/val
+  photo_train: data/landscape
+  ink_train: data/ink/shui_mo
   checkpoints: outputs/cyclegan/checkpoints
   samples: outputs/cyclegan/samples

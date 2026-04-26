@@ -6,13 +6,24 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from case9.models.cyclegan.generator_unet import UNetGenerator
+from src.models.cyclegan.networks import define_G
 
 
-def load_model(ckpt_path: str, device: torch.device) -> UNetGenerator:
-    model = UNetGenerator().to(device)
+def load_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["g"])
+    model_cfg = ckpt["model_config"]
+    model = define_G(
+        3,
+        3,
+        model_cfg["ngf"],
+        model_cfg["netG"],
+        model_cfg["norm"],
+        model_cfg["use_dropout"],
+        model_cfg["init_type"],
+        model_cfg["init_gain"],
+        device,
+    )
+    model.load_state_dict(ckpt["G_A"])
     model.eval()
     return model
 
@@ -38,7 +49,7 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = [in_path] if in_path.is_file() else [p for p in in_path.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}]
+    image_paths = [in_path] if in_path.is_file() else [p for p in sorted(in_path.iterdir()) if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}]
 
     with torch.no_grad():
         for p in image_paths:
